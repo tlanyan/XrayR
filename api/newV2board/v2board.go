@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/bitly/go-simplejson"
 	"github.com/go-resty/resty/v2"
@@ -29,12 +30,12 @@ type APIClient struct {
 	Key           string
 	NodeType      string
 	EnableVless   bool
-	EnableXTLS    bool
+	VlessFlow     string
 	SpeedLimit    float64
 	DeviceLimit   int
 	LocalRuleList []api.DetectRule
 	resp          atomic.Value
-	eTag          string
+	eTags         map[string]string
 }
 
 // New create an api instance
@@ -54,10 +55,18 @@ func New(apiConfig *api.Config) *APIClient {
 		}
 	})
 	client.SetBaseURL(apiConfig.APIHost)
+
+	var nodeType string
+
+	if apiConfig.NodeType == "V2ray" && apiConfig.EnableVless {
+		nodeType = "vless"
+	} else {
+		nodeType = strings.ToLower(apiConfig.NodeType)
+	}
 	// Create Key for each requests
 	client.SetQueryParams(map[string]string{
 		"node_id":   strconv.Itoa(apiConfig.NodeID),
-		"node_type": strings.ToLower(apiConfig.NodeType),
+		"node_type": nodeType,
 		"token":     apiConfig.Key,
 	})
 	// Read local rule list
@@ -69,10 +78,11 @@ func New(apiConfig *api.Config) *APIClient {
 		APIHost:       apiConfig.APIHost,
 		NodeType:      apiConfig.NodeType,
 		EnableVless:   apiConfig.EnableVless,
-		EnableXTLS:    apiConfig.EnableXTLS,
+		VlessFlow:     apiConfig.VlessFlow,
 		SpeedLimit:    apiConfig.SpeedLimit,
 		DeviceLimit:   apiConfig.DeviceLimit,
 		LocalRuleList: localRuleList,
+		eTags:         make(map[string]string),
 	}
 	return apiClient
 }
@@ -147,8 +157,18 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	path := "/api/v1/server/UniProxy/config"
 
 	res, err := c.client.R().
+		SetHeader("If-None-Match", c.eTags["node"]).
 		ForceContentType("application/json").
 		Get(path)
+
+	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
+	if res.StatusCode() == 304 {
+		return nil, errors.New(api.NodeNotModified)
+	}
+	// update etag
+	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["node"] {
+		c.eTags["node"] = res.Header().Get("Etag")
+	}
 
 	nodeInfoResp, err := c.parseResponse(res, path, err)
 	if err != nil {
@@ -164,7 +184,7 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	c.resp.Store(server)
 
 	switch c.NodeType {
-	case "V2ray":
+	case "V2ray", "Vmess", "Vless":
 		nodeInfo, err = c.parseV2rayNodeResponse(server)
 	case "Trojan":
 		nodeInfo, err = c.parseTrojanNodeResponse(server)
@@ -187,24 +207,24 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/api/v1/server/UniProxy/user"
 
 	switch c.NodeType {
-	case "V2ray", "Trojan", "Shadowsocks":
+	case "V2ray", "Trojan", "Shadowsocks", "Vmess", "Vless":
 		break
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
 	}
 
 	res, err := c.client.R().
-		SetHeader("If-None-Match", c.eTag).
+		SetHeader("If-None-Match", c.eTags["users"]).
 		ForceContentType("application/json").
 		Get(path)
 
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
 	if res.StatusCode() == 304 {
-		return nil, errors.New("users no change")
+		return nil, errors.New(api.UserNotModified)
 	}
 	// update etag
-	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTag {
-		c.eTag = res.Header().Get("Etag")
+	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["users"] {
+		c.eTags["users"] = res.Header().Get("Etag")
 	}
 
 	usersResp, err := c.parseResponse(res, path, err)
@@ -213,6 +233,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	}
 	b, _ := usersResp.Get("users").Encode()
 	json.Unmarshal(b, &users)
+	if len(users) == 0 {
+		return nil, errors.New("users is null")
+	}
 
 	userList := make([]api.UserInfo, len(users))
 	for i := 0; i < len(users); i++ {
@@ -293,11 +316,6 @@ func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
 
 // parseTrojanNodeResponse parse the response for the given nodeInfo format
 func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
-	var TLSType = "tls"
-	if c.EnableXTLS {
-		TLSType = "xtls"
-	}
-
 	// Create GeneralNodeInfo
 	nodeInfo := &api.NodeInfo{
 		NodeType:          c.NodeType,
@@ -305,7 +323,6 @@ func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, err
 		Port:              uint32(s.ServerPort),
 		TransportProtocol: "tcp",
 		EnableTLS:         true,
-		TLSType:           TLSType,
 		Host:              s.Host,
 		ServiceName:       s.ServerName,
 		NameServerConfig:  s.parseDNSConfig(),
@@ -347,14 +364,35 @@ func (c *APIClient) parseSSNodeResponse(s *serverConfig) (*api.NodeInfo, error) 
 // parseV2rayNodeResponse parse the response for the given nodeInfo format
 func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
 	var (
-		TLSType   = "tls"
-		host      string
-		header    json.RawMessage
-		enableTLS bool
+		host          string
+		header        json.RawMessage
+		enableTLS     bool
+		enableREALITY bool
+		dest          string
+		xVer          uint64
 	)
 
-	if c.EnableXTLS {
-		TLSType = "xtls"
+	if s.VlessTlsSettings.Dest != "" {
+		dest = s.VlessTlsSettings.Dest
+	} else {
+		dest = s.VlessTlsSettings.Sni
+	}
+	if s.VlessTlsSettings.xVer != 0 {
+		xVer = s.VlessTlsSettings.xVer
+	} else {
+		xVer = 0
+	}
+
+	realityConfig := api.REALITYConfig{
+		Dest:             dest + ":" + s.VlessTlsSettings.ServerPort,
+		ProxyProtocolVer: xVer,
+		ServerNames:      []string{s.VlessTlsSettings.Sni},
+		PrivateKey:       s.VlessTlsSettings.PrivateKey,
+		ShortIds:         []string{s.VlessTlsSettings.ShortId},
+	}
+
+	if c.EnableVless {
+		s.NetworkSettings = s.VlessNetworkSettings
 	}
 
 	switch s.Network {
@@ -375,10 +413,30 @@ func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, erro
 				header = httpHeader
 			}
 		}
+	case "httpupgrade", "splithttp":
+		if s.NetworkSettings.Headers != nil {
+			if httpHeaders, err := s.NetworkSettings.Headers.MarshalJSON(); err != nil {
+				return nil, err
+			} else {
+				b, _ := simplejson.NewJson(httpHeaders)
+				host = b.Get("Host").MustString()
+			}
+		}
+		if s.NetworkSettings.Host != "" {
+			host = s.NetworkSettings.Host
+		}
 	}
 
-	if s.Tls == 1 {
+	switch s.Tls {
+	case 0:
+		enableTLS = false
+		enableREALITY = false
+	case 1:
 		enableTLS = true
+		enableREALITY = false
+	case 2:
+		enableTLS = true
+		enableREALITY = true
 	}
 
 	// Create GeneralNodeInfo
@@ -389,12 +447,14 @@ func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, erro
 		AlterID:           0,
 		TransportProtocol: s.Network,
 		EnableTLS:         enableTLS,
-		TLSType:           TLSType,
 		Path:              s.NetworkSettings.Path,
 		Host:              host,
 		EnableVless:       c.EnableVless,
+		VlessFlow:         s.VlessFlow,
 		ServiceName:       s.NetworkSettings.ServiceName,
 		Header:            header,
+		EnableREALITY:     enableREALITY,
+		REALITYConfig:     &realityConfig,
 		NameServerConfig:  s.parseDNSConfig(),
 	}, nil
 }

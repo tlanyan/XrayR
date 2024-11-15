@@ -26,12 +26,10 @@ jobs:
     strategy:
       matrix:
         # Include amd64 on all platforms.
-        goos: [ windows, freebsd, openbsd, linux, dragonfly, darwin ]
+        goos: [ windows, freebsd, openbsd, linux, darwin ]
         goarch: [ amd64, 386 ]
         exclude:
-          # Exclude i386 on darwin and dragonfly.
-          - goarch: 386
-            goos: dragonfly
+          # Exclude i386 on darwin.
           - goarch: 386
             goos: darwin
           - goarch: 386
@@ -113,7 +111,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v3
         with:
-          go-version: ^1.19
+          go-version: ^1.20
 
       - name: Get project dependencies
         run: go mod download
@@ -122,12 +120,12 @@ jobs:
       - name: Build XrayR
         run: |
           mkdir -p build_assets
-          go build -v -o build_assets/XrayR -trimpath -ldflags "-s -w -buildid=" ./main
+          go build -v -o build_assets/XrayR -trimpath -ldflags "-s -w -buildid="
 
       - name: Build Mips softfloat XrayR
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
-          GOMIPS=softfloat go build -v -o build_assets/XrayR_softfloat -trimpath -ldflags "-s -w -buildid=" ./main
+          GOMIPS=softfloat go build -v -o build_assets/XrayR_softfloat -trimpath -ldflags "-s -w -buildid="
       - name: Rename Windows XrayR
         if: matrix.goos == 'windows'
         run: |
@@ -143,12 +141,12 @@ jobs:
           command: |
             cp ${GITHUB_WORKSPACE}/README.md ./build_assets/README.md
             cp ${GITHUB_WORKSPACE}/LICENSE ./build_assets/LICENSE
-            cp ${GITHUB_WORKSPACE}/main/dns.json ./build_assets/dns.json
-            cp ${GITHUB_WORKSPACE}/main/route.json ./build_assets/route.json
-            cp ${GITHUB_WORKSPACE}/main/custom_outbound.json ./build_assets/custom_outbound.json
-            cp ${GITHUB_WORKSPACE}/main/custom_inbound.json ./build_assets/custom_inbound.json
-            cp ${GITHUB_WORKSPACE}/main/rulelist ./build_assets/rulelist
-            cp ${GITHUB_WORKSPACE}/main/config.yml.example ./build_assets/config.yml
+            cp ${GITHUB_WORKSPACE}/release/config/dns.json ./build_assets/dns.json
+            cp ${GITHUB_WORKSPACE}/release/config/route.json ./build_assets/route.json
+            cp ${GITHUB_WORKSPACE}/release/config/custom_outbound.json ./build_assets/custom_outbound.json
+            cp ${GITHUB_WORKSPACE}/release/config/custom_inbound.json ./build_assets/custom_inbound.json
+            cp ${GITHUB_WORKSPACE}/release/config/rulelist ./build_assets/rulelist
+            cp ${GITHUB_WORKSPACE}/release/config/config.yml.example ./build_assets/config.yml
             LIST=('geoip geoip geoip' 'domain-list-community dlc geosite')
             for i in "${LIST[@]}"
             do
